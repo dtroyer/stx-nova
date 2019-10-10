@@ -1,0 +1,47 @@
+From 8cfdb1a57e9f714a76c2f6e70b1cb8354b3ed434 Mon Sep 17 00:00:00 2001
+From: Jack Ding <jack.ding@windriver.com>
+Date: Tue, 30 May 2017 13:06:43 -0400
+Subject: [PATCH 1/1] synchronize _sync_instance_power_state() from
+ LifeCycle events
+
+Calling _sync_instance_power_state() from power_state periodic audit
+is already synchronized. This change makes calling this function from
+LifeCycle events handling path synchronized to avoid race conditions
+when 2 threads calling the same function.
+
+This change is a candidate for upstreaming.
+---
+ nova/compute/manager.py | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 197426c1f8..e0bd54f293 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -1104,6 +1104,12 @@ class ComputeManager(manager.Manager):
+             LOG.warning(_LW("Unexpected power state %d"),
+                         event.get_transition())
+ 
++        @utils.synchronized(instance.uuid)
++        def sync_instance_power_state():
++            self._sync_instance_power_state(context,
++                                            instance,
++                                            vm_power_state)
++
+         # Note(lpetrut): The event may be delayed, thus not reflecting
+         # the current instance power state. In that case, ignore the event.
+         current_power_state = self._get_power_state(context, instance)
+@@ -1124,9 +1130,7 @@ class ComputeManager(manager.Manager):
+                        'db_power_state': instance.power_state,
+                        'vm_power_state': vm_power_state},
+                       instance_uuid=instance.uuid)
+-            self._sync_instance_power_state(context,
+-                                            instance,
+-                                            vm_power_state)
++            sync_instance_power_state()
+ 
+     def handle_events(self, event):
+         if isinstance(event, virtevent.LifecycleEvent):
+-- 
+2.20.1
+

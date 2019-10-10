@@ -1,0 +1,305 @@
+From 80cfc70d0c08cbcf1aafe88a2bd059df729491c7 Mon Sep 17 00:00:00 2001
+From: Chris Friesen <chris.friesen@windriver.com>
+Date: Mon, 16 Mar 2015 16:26:20 -0600
+Subject: [PATCH 1/1] add audit to clean up orphan instances
+
+This commit adds an audit to find and deal with instances that are
+listed in the hypervisor on a given compute node but are not
+listed in the nova database as running on that compute node.
+
+Instances in the middle of migration or waiting for resize/migrate
+confirmation will not be destroyed.
+
+As part of this we introduce a libvirt routine to destroy/undefine
+a domain given only the name (needed if the domain is not listed
+in the nova DB).
+
+If we take an exception getting the information from the nova DB,
+there's not much point in continuing the audit with bad data so
+just exit and hope it does better next time around.
+
+Also, if we get an InstanceNotFound exception when doing the
+destroy(), there's a chance we'll get it when calling cleanup() so
+just ignore that exception and continue on.
+
+This includes the following kilo commits:
+6138f54c add audit to clean up orphan instances
+5342042f Trouble destroying illegitimate instance
+ac7b182d improve orphan audit robustness
+
+Change-Id: I4ca36a44d20be7493f58a69029f966eb62c6a921
+---
+ nova/compute/manager.py                 | 129 ++++++++++++++++++++++++
+ nova/tests/unit/compute/test_compute.py |  27 +++++
+ nova/virt/driver.py                     |  10 ++
+ nova/virt/libvirt/driver.py             |  47 +++++++++
+ 4 files changed, 213 insertions(+)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index fd1589b07a..e7d78aab28 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -733,6 +733,7 @@ class ComputeManager(manager.Manager):
+                 CONF.max_concurrent_live_migrations)
+         else:
+             self._live_migration_semaphore = compute_utils.UnlimitedSemaphore()
++        self.suspected_uuids = set([])
+ 
+         super(ComputeManager, self).__init__(service_name="compute",
+                                              *args, **kwargs)
+@@ -1355,6 +1356,8 @@ class ComputeManager(manager.Manager):
+                            cgcs_messaging.CGCSMessaging(self.compute_task_api)
+ 
+         try:
++            # Destroy any running domains not in the DB
++            self._destroy_orphan_instances(context)
+             # checking that instance was not already evacuated to other host
+             self._destroy_evacuated_instances(context)
+             for instance in instances:
+@@ -7027,3 +7030,129 @@ class ComputeManager(manager.Manager):
+                               error, instance=instance)
+         image_meta = objects.ImageMeta.from_instance(instance)
+         self.driver.unquiesce(context, instance, image_meta)
++
++    def _destroy_orphan_instances(self, context):
++        """Helper to destroy orphan instances.
++
++        Destroys instances that are lingering on hypervisor without
++        a record in the database. Deleted instances with database records
++        will be cleaned up by _cleanup_running_deleted_instances().
++        """
++        # Determine instances on this hypervisor and find each corresponding
++        # instance in the database.
++        filters = {}
++        local_instances = []
++        try:
++            driver_instances = self.driver.list_instances()
++            driver_uuids = self.driver.list_instance_uuids()
++            filters['uuid'] = driver_uuids
++            with utils.temporary_mutation(context, read_deleted='yes'):
++                local_instances = objects.InstanceList.get_by_filters(
++                    context, filters, use_slave=True)
++            db_names = [instance.name for instance in local_instances]
++        except Exception:
++            LOG.error(_LE('Error finding orphans instances'), exc_info=1)
++            return
++
++        # Instances found on hypervisor but not in database are orphans.
++        # We want to destroy them, but they have no DB entry so we can't
++        # use self.driver.destroy()
++        orphan_instances = set(driver_instances) - set(db_names)
++        for inst_name in orphan_instances:
++            try:
++                LOG.warning(_LW('Detected orphan instance %s on hypervisor '
++                            'but not in nova database; deleting this domain.')
++                            % inst_name)
++                self.driver.destroy_name(inst_name)
++            except Exception as ex:
++                LOG.warning(_LW('Trouble destroying orphan %(name)s: '
++                                '%(details)s'),
++                            {'name': inst_name, 'details': ex})
++
++        # Now find instances that are in the nova DB but aren't
++        # supposed to be running on this host.  Ignore ones that are
++        # migrating/resizing or waiting for migrate/resize confirmation.
++        # task_state of RESIZE_MIGRATED/RESIZE_FINISH is fair game.
++        suspected_instances = []
++        for instance in local_instances:
++            if instance.host != self.host:
++                if (instance.task_state in [task_states.MIGRATING,
++                                            task_states.RESIZE_MIGRATING]
++                        or instance.vm_state in [vm_states.RESIZED]):
++                    continue
++                else:
++                    suspected_instances.append(instance)
++        suspected_instances = set(suspected_instances)
++
++        # Look for suspected instances that were also suspect last time
++        # through the audit.  If so we will kill them.
++        to_kill = set([instance for instance in suspected_instances
++                       if instance.uuid in self.suspected_uuids])
++        suspected_instances -= to_kill
++        self.suspected_uuids = set([instance.uuid for instance in
++                                           suspected_instances])
++        for instance in to_kill:
++            try:
++                # Logic taken from _destroy_evacuated_instances()
++                LOG.info(_LI('Deleting instance %(inst_name)s as its host ('
++                             '%(instance_host)s) is not equal to our '
++                             'host (%(our_host)s).'),
++                         {'inst_name': instance.name,
++                          'instance_host': instance.host,
++                          'our_host': self.host}, instance=instance)
++
++                # WRS: Calling self.driver.destroy when the instance is not
++                # found in the database causes self.driver.cleanup to fail
++                # because is it trying to access the instance in the database.
++                # More precisely when it is trying to destroy the disks.
++                instance_not_found = False
++                try:
++                    network_info = self.network_api.get_instance_nw_info(
++                        context, instance)
++                    bdi = self._get_instance_block_device_info(context,
++                                                               instance)
++                    destroy_disks = not (self._is_instance_storage_shared(
++                                                            context, instance))
++                except exception.InstanceNotFound:
++                    instance_not_found = True
++                    network_info = network_model.NetworkInfo()
++                    bdi = {}
++                    LOG.info(_LI('Instance has been marked deleted already, '
++                                 'removing it from the hypervisor.'),
++                             instance=instance)
++                    # always destroy disks if the instance was deleted
++                    destroy_disks = True
++
++                try:
++                    self.driver.destroy(context, instance,
++                                        network_info,
++                                        bdi, destroy_disks)
++                except exception.InstanceNotFound as ex:
++                    if instance_not_found:
++                        # We want to ensure that we want to ensure that we
++                        # clean up as much as possible
++                        try:
++                            self.driver.cleanup(context, instance,
++                                                network_info,
++                                                bdi, destroy_disks=False)
++                        except exception.InstanceNotFound as ex:
++                            # The above call may throw an exception but
++                            # we want to call it anyways since it might
++                            # clean things up a bit.
++                            pass
++                    else:
++                        raise ex
++            except Exception as ex:
++                LOG.warning(_LW('Trouble destroying illegitimate instance '
++                            '%(inst_name)s: %(details)s.'),
++                            {'inst_name': instance.name,
++                             'details': ex})
++
++    @periodic_task.periodic_task(spacing=300)
++    def _cleanup_running_orphan_instances(self, context):
++        """Cleanup orphan instances.
++
++        Periodic task to clean up instances which are erroneously still
++        lingering on the hypervisor without a record in the database.
++        """
++        self._destroy_orphan_instances(context)
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index 5265d528ad..7ca506ca99 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -6141,6 +6141,33 @@ class ComputeTestCase(BaseTestCase):
+                                                   exc_info,
+                                                   fault_message='hoge')
+ 
++    def test_cleanup_orphan_domain(self):
++        instance = self._create_fake_instance_obj({'host': 'dummyhost'})
++        fake_name = 'dummyname'
++        fake_uuid = 'some-instance-uuid-aaa'
++        with test.nested(
++            mock.patch.object(objects.InstanceList, 'get_by_filters'),
++            mock.patch.object(self.compute.driver, 'list_instances'),
++            mock.patch.object(self.compute.driver, 'list_instance_uuids'),
++            mock.patch.object(self.compute.driver, 'destroy_name'),
++            mock.patch.object(self.compute.driver, 'destroy')
++        ) as (
++            instance_get_by_filters_mock,
++            list_instances_mock,
++            list_instance_uuids_mock,
++            destroy_name_mock,
++            destroy_mock
++        ):
++            instance_get_by_filters_mock.return_value = [instance]
++            list_instances_mock.return_value = [fake_name, instance.name]
++            list_instance_uuids_mock.return_value = [fake_uuid, instance.uuid]
++            self.compute._destroy_orphan_instances(self.context)
++            destroy_name_mock.assert_called_once_with(fake_name)
++            self.assertEqual(self.compute.suspected_uuids, ({instance.uuid}))
++            self.compute._destroy_orphan_instances(self.context)
++            destroy_mock.assert_called_once_with(self.context, instance,
++                                                 mock.ANY, mock.ANY, mock.ANY)
++
+     def _test_cleanup_running(self, action):
+         admin_context = context.get_admin_context()
+         deleted_at = (timeutils.utcnow() -
+diff --git a/nova/virt/driver.py b/nova/virt/driver.py
+index 6a2cd8a316..cfa41e8bdc 100644
+--- a/nova/virt/driver.py
++++ b/nova/virt/driver.py
+@@ -1616,6 +1616,16 @@ class ComputeDriver(object):
+         """Hot-add a cpu to an instance."""
+         raise NotImplementedError()
+ 
++    def destroy_name(self, instance_name):
++        """Destroy an instance domain if we only know 'name' and not the full
++        instance (i.e., we lost instance object and it is not in Database).
++        Using this routine is a last resort to reap instances, the preferred
++        method is to use self.destroy(instance).
++
++        This does not unplug VIFs, destroy block devices, or destroy disks.
++        """
++        raise NotImplementedError()
++
+ 
+ def load_compute_driver(virtapi, compute_driver=None):
+     """Load a compute driver module.
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index eb67a3d66b..691e5165de 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -8314,3 +8314,50 @@ class LibvirtDriver(driver.ComputeDriver):
+             pass
+ 
+         return virt_cpu
++
++    def destroy_name(self, instance_name):
++        """Destroy a domain by name.
++
++        Destroy a domain if we only know 'name' and not the full instance
++        (i.e., we lost or never had the instance object and it is not in
++        the DB.)  Using this routine is a last resort to reap instances, the
++        preferred method is to use self.destroy(instance).
++
++        This does not unplug VIFs, destroy block devices, or destroy disks.
++        """
++        try:
++            virt_dom = self._host._get_domain_by_name(instance_name)
++            try:
++                (state, _max_mem, _mem, _cpus, _t) = virt_dom.info()
++                state = libvirt_guest.LIBVIRT_POWER_STATE[state]
++                if state not in [power_state.SHUTDOWN, power_state.CRASHED]:
++                    virt_dom.destroy()
++            except libvirt.libvirtError as e:
++                errcode = e.get_error_code()
++                if errcode == libvirt.VIR_ERR_OPERATION_TIMEOUT:
++                    LOG.warn(
++                        _LW("Cannot destroy instance, operation time out, %s")
++                        % instance_name)
++                    reason = _("operation time out")
++                    raise exception.InstancePowerOffFailure(reason=reason)
++                with excutils.save_and_reraise_exception():
++                    LOG.error(_LE('Error from libvirt during destroy. '
++                              'Code=%(errcode)s Error=%(e)s, name=%(name)s')
++                              % ({'errcode': errcode,
++                                  'e': e,
++                                  'name': instance_name}))
++
++            try:
++                virt_dom.undefineFlags(
++                    libvirt.VIR_DOMAIN_UNDEFINE_MANAGED_SAVE)
++            except libvirt.libvirtError as e:
++                with excutils.save_and_reraise_exception():
++                    errcode = e.get_error_code()
++                    LOG.error(_LE('Error from libvirt during destroy. '
++                              'Code=%(errcode)s Error=%(e)s, name=%(name)s')
++                              % ({'errcode': errcode,
++                                  'e': e,
++                                  'name': instance_name}))
++        except exception.InstanceNotFound:
++            # If the instance is already gone, we're happy.
++            pass
+-- 
+2.20.1
+

@@ -1,0 +1,190 @@
+From 7063b69cf15d65e6137b3b821683b4c349923ad3 Mon Sep 17 00:00:00 2001
+From: "Tao.Liu" <tao.liu@windriver.com>
+Date: Tue, 3 Mar 2015 18:21:57 -0500
+Subject: [PATCH 1/1] VIM: Refactor KVM failure detection and recovery
+
+This moves the kvm failure detection and recovery functionality into
+TiS VIM. This update includes nova changes to distinguish between a
+KVM crash and stop, as well as sending crash notification
+
+Summitted for : US51196
+---
+ nova/compute/manager.py                     | 15 +++++++++++++--
+ nova/notifications.py                       |  2 ++
+ nova/tests/unit/compute/test_compute_mgr.py | 12 ++++++------
+ nova/tests/unit/test_notifications.py       |  3 ++-
+ nova/tests/unit/virt/libvirt/fakelibvirt.py |  9 +++++++++
+ nova/virt/event.py                          |  4 +++-
+ nova/virt/libvirt/host.py                   |  5 ++++-
+ 7 files changed, 39 insertions(+), 11 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 65b6765fc1..b7fccaac30 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -1233,6 +1233,8 @@ class ComputeManager(manager.Manager):
+             vm_power_state = power_state.PAUSED
+         elif event.get_transition() == virtevent.EVENT_LIFECYCLE_RESUMED:
+             vm_power_state = power_state.RUNNING
++        elif event.get_transition() == virtevent.EVENT_LIFECYCLE_CRASHED:
++            vm_power_state = power_state.CRASHED
+         else:
+             LOG.warning(_LW("Unexpected power state %d"),
+                         event.get_transition())
+@@ -4623,6 +4625,12 @@ class ComputeManager(manager.Manager):
+         self._update_scheduler_instance_info(context, instance)
+         self._notify_about_instance_usage(context, instance, 'unshelve.end')
+ 
++    def _request_recovery(self, context, instance):
++        """Instance crashed notification for recovery request."""
++        instance.save(expected_task_state=[None])
++        self._instance_update(context, instance.uuid,
++                              power_state=power_state.CRASHED)
++
+     @messaging.expected_exceptions(NotImplementedError)
+     @wrap_instance_fault
+     def reset_network(self, context, instance):
+@@ -6329,8 +6337,7 @@ class ComputeManager(manager.Manager):
+             pass
+         elif vm_state == vm_states.ACTIVE:
+             # The only rational power state should be RUNNING
+-            if vm_power_state in (power_state.SHUTDOWN,
+-                                  power_state.CRASHED):
++            if vm_power_state == power_state.SHUTDOWN:
+                 LOG.warning(_LW("Instance shutdown by itself. Calling the "
+                                 "stop API. Current vm_state: %(vm_state)s, "
+                                 "current task_state: %(task_state)s, "
+@@ -6357,6 +6364,10 @@ class ComputeManager(manager.Manager):
+                     LOG.exception(_LE("error during stop() in "
+                                       "sync_power_state."),
+                                   instance=db_instance)
++            elif vm_power_state == power_state.CRASHED:
++                LOG.warning(_LW("Instance crashed. Let VIM recovers it.(%s)") %
++                          db_instance.uuid)
++                self._request_recovery(context, db_instance)
+             elif vm_power_state == power_state.SUSPENDED:
+                 LOG.warning(_LW("Instance is suspended unexpectedly. Calling "
+                                 "the stop API."), instance=db_instance)
+diff --git a/nova/notifications.py b/nova/notifications.py
+index ee553e7e35..9ad1228563 100644
+--- a/nova/notifications.py
++++ b/nova/notifications.py
+@@ -212,11 +212,13 @@ def _compute_states_payload(instance, old_vm_state=None,
+     if old_task_state is None:
+         old_task_state = instance["task_state"]
+ 
++    power_state = instance["power_state"]
+     states_payload = {
+         "old_state": old_vm_state,
+         "state": new_vm_state,
+         "old_task_state": old_task_state,
+         "new_task_state": new_task_state,
++        "power_state": power_state,
+     }
+     return states_payload
+ 
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index 803cacfd8a..f3e2735335 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -79,7 +79,8 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         event_map = {virtevent.EVENT_LIFECYCLE_STOPPED: power_state.SHUTDOWN,
+                      virtevent.EVENT_LIFECYCLE_STARTED: power_state.RUNNING,
+                      virtevent.EVENT_LIFECYCLE_PAUSED: power_state.PAUSED,
+-                     virtevent.EVENT_LIFECYCLE_RESUMED: power_state.RUNNING}
++                     virtevent.EVENT_LIFECYCLE_RESUMED: power_state.RUNNING,
++                     virtevent.EVENT_LIFECYCLE_CRASHED: power_state.CRASHED}
+         event = mock.Mock()
+         event.get_instance_uuid.return_value = mock.sentinel.uuid
+         for transition, pwr_state in event_map.iteritems():
+@@ -1216,13 +1217,12 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         self.mox.UnsetStubs()
+ 
+     def test_sync_instance_power_state_to_stop(self):
+-        for ps in (power_state.SHUTDOWN, power_state.CRASHED,
+-                   power_state.SUSPENDED):
++        for ps in (power_state.SHUTDOWN, power_state.SUSPENDED):
+             self._test_sync_to_stop(power_state.RUNNING, vm_states.ACTIVE, ps)
+ 
+-        for ps in (power_state.SHUTDOWN, power_state.CRASHED):
+-            self._test_sync_to_stop(power_state.PAUSED, vm_states.PAUSED, ps,
+-                                    force=True)
++        ps = power_state.SHUTDOWN
++        self._test_sync_to_stop(power_state.PAUSED, vm_states.PAUSED, ps,
++                                force=True)
+ 
+         self._test_sync_to_stop(power_state.SHUTDOWN, vm_states.STOPPED,
+                                 power_state.RUNNING, force=True)
+diff --git a/nova/tests/unit/test_notifications.py b/nova/tests/unit/test_notifications.py
+index e5fcab7a65..7cb1a40b92 100644
+--- a/nova/tests/unit/test_notifications.py
++++ b/nova/tests/unit/test_notifications.py
+@@ -437,7 +437,8 @@ class NotificationsFormatTestCase(test.NoDBTestCase):
+ 
+     def test_state_computation(self):
+         instance = {'vm_state': mock.sentinel.vm_state,
+-                    'task_state': mock.sentinel.task_state}
++                    'task_state': mock.sentinel.task_state,
++                    'power_state': None}
+         states = notifications._compute_states_payload(instance)
+         self.assertEqual(mock.sentinel.vm_state, states['state'])
+         self.assertEqual(mock.sentinel.vm_state, states['old_state'])
+diff --git a/nova/tests/unit/virt/libvirt/fakelibvirt.py b/nova/tests/unit/virt/libvirt/fakelibvirt.py
+index d2970442eb..e72202570c 100644
+--- a/nova/tests/unit/virt/libvirt/fakelibvirt.py
++++ b/nova/tests/unit/virt/libvirt/fakelibvirt.py
+@@ -95,6 +95,15 @@ VIR_NODE_CPU_STATS_ALL_CPUS = -1
+ 
+ VIR_DOMAIN_START_PAUSED = 1
+ 
++# virDomainEventStoppedDetailType
++VIR_DOMAIN_EVENT_STOPPED_SHUTDOWN = 0
++VIR_DOMAIN_EVENT_STOPPED_DESTROYED = 1
++VIR_DOMAIN_EVENT_STOPPED_CRASHED = 2
++VIR_DOMAIN_EVENT_STOPPED_MIGRATED = 3
++VIR_DOMAIN_EVENT_STOPPED_SAVED = 4
++VIR_DOMAIN_EVENT_STOPPED_FAILED = 5
++VIR_DOMAIN_EVENT_STOPPED_FROM_SNAPSHOT = 6
++
+ # libvirtError enums
+ # (Intentionally different from what's in libvirt. We do this to check,
+ #  that consumers of the library are using the symbolic names rather than
+diff --git a/nova/virt/event.py b/nova/virt/event.py
+index 02b9cddbd5..926b0dfd76 100644
+--- a/nova/virt/event.py
++++ b/nova/virt/event.py
+@@ -28,12 +28,14 @@ EVENT_LIFECYCLE_STARTED = 0
+ EVENT_LIFECYCLE_STOPPED = 1
+ EVENT_LIFECYCLE_PAUSED = 2
+ EVENT_LIFECYCLE_RESUMED = 3
++EVENT_LIFECYCLE_CRASHED = 4
+ 
+ NAMES = {
+     EVENT_LIFECYCLE_STARTED: _('Started'),
+     EVENT_LIFECYCLE_STOPPED: _('Stopped'),
+     EVENT_LIFECYCLE_PAUSED: _('Paused'),
+-    EVENT_LIFECYCLE_RESUMED: _('Resumed')
++    EVENT_LIFECYCLE_RESUMED: _('Resumed'),
++    EVENT_LIFECYCLE_CRASHED: _('Crashed')
+ }
+ 
+ 
+diff --git a/nova/virt/libvirt/host.py b/nova/virt/libvirt/host.py
+index 36a9942673..75e437d050 100644
+--- a/nova/virt/libvirt/host.py
++++ b/nova/virt/libvirt/host.py
+@@ -252,7 +252,10 @@ class Host(object):
+         uuid = dom.UUIDString()
+         transition = None
+         if event == libvirt.VIR_DOMAIN_EVENT_STOPPED:
+-            transition = virtevent.EVENT_LIFECYCLE_STOPPED
++            if detail == libvirt.VIR_DOMAIN_EVENT_STOPPED_FAILED:
++                transition = virtevent.EVENT_LIFECYCLE_CRASHED
++            else:
++                transition = virtevent.EVENT_LIFECYCLE_STOPPED
+         elif event == libvirt.VIR_DOMAIN_EVENT_STARTED:
+             transition = virtevent.EVENT_LIFECYCLE_STARTED
+         elif event == libvirt.VIR_DOMAIN_EVENT_SUSPENDED:
+-- 
+2.20.1
+

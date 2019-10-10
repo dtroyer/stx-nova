@@ -1,0 +1,122 @@
+From cf95427320e42f18494dd9f4bc95abd1e4fca6b8 Mon Sep 17 00:00:00 2001
+From: Jack Ding <jack.ding@windriver.com>
+Date: Tue, 30 May 2017 14:08:13 -0400
+Subject: [PATCH 1/1] VMs remain in shutoff state after killing kvm process.
+
+These changes deal with race conditions between power_state audit
+and instance lifecycle events handling when killing kvm process.
+
+1. Skip stopping instance if current DB power_state is CRASHED.
+Without this change when instance is stopped by power_state audit
+the available_state is reset to '' from 'failed, crashed'. If VIM
+happens to check the available_state at this time after failed the
+instance during recovering process, it considers fail-instance task
+is not complete therefore reboot fsm is stuck for ever.
+
+2. In _sync_instance_power_state(), reset task_state to None when
+instance crashed. Without this change, if task_state is set to
+powering-off by power_state audit thread the reboot triggered by VIM
+recovery will fail.
+
+3. In _sync_instance_power_state(), return if db power_state is
+set to crashed. DB power_state being CRASHED here means the instance
+is in the middle of handling lifecycle event. The current thread is
+from power_state audit and it should be skipped to allow lifecyle
+handling to proceed to instance recovery.
+---
+ nova/compute/manager.py                     | 39 +++++++++++++++------
+ nova/tests/unit/compute/test_compute_mgr.py |  5 ++-
+ 2 files changed, 33 insertions(+), 11 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index e0bd54f293..3366184e63 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -2616,6 +2616,15 @@ class ComputeManager(manager.Manager):
+         @utils.synchronized(instance.uuid)
+         def do_stop_instance():
+             current_power_state = self._get_power_state(context, instance)
++            # WRS: Get the latest DB info to minimize race condition.
++            # If the instance is crashed, skip stopping and let VIM recovery
++            # code takes over.
++            instance.refresh()
++            if instance.power_state == power_state.CRASHED:
++                LOG.info(_LI('Skip stopping instance since instance crashed.'),
++                         instance_uuid=instance.uuid)
++                return
++
+             # WRS:  Extra logging for debugging issue with stuck
+             # task_state.
+             LOG.info(_LI('Stopping instance; current vm_state: %(vm_state)s, '
+@@ -6790,6 +6799,10 @@ class ComputeManager(manager.Manager):
+         db_power_state = db_instance.power_state
+         vm_state = db_instance.vm_state
+ 
++        # WRS: skip periodic synv when VM Crashed event is being handled
++        if db_power_state == power_state.CRASHED:
++            return
++
+         if self.host != db_instance.host:
+             # on the sending end of nova-compute _sync_power_state
+             # may have yielded to the greenthread performing a live
+@@ -6806,16 +6819,22 @@ class ComputeManager(manager.Manager):
+                      instance=db_instance)
+             return
+         elif db_instance.task_state is not None:
+-            # on the receiving end of nova-compute, it could happen
+-            # that the DB instance already report the new resident
+-            # but the actual VM has not showed up on the hypervisor
+-            # yet. In this case, let's allow the loop to continue
+-            # and run the state sync in a later round
+-            LOG.info(_LI("During sync_power_state the instance has a "
+-                         "pending task (%(task)s). Skip."),
+-                     {'task': db_instance.task_state},
+-                     instance=db_instance)
+-            return
++            # WRS: if instance crashed reset task_state to allow recovery
++            if vm_state == vm_states.ACTIVE \
++                    and vm_power_state == power_state.CRASHED:
++                db_instance.task_state = None
++                db_instance.save()
++            else:
++                # on the receiving end of nova-compute, it could happen
++                # that the DB instance already report the new resident
++                # but the actual VM has not showed up on the hypervisor
++                # yet. In this case, let's allow the loop to continue
++                # and run the state sync in a later round
++                LOG.info(_LI("During sync_power_state the instance has a "
++                             "pending task (%(task)s). Skip."),
++                         {'task': db_instance.task_state},
++                         instance=db_instance)
++                return
+ 
+         orig_db_power_state = db_power_state
+         if vm_power_state != db_power_state:
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index c031103386..27c6b9e97b 100755
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -2998,16 +2998,19 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+             self.context, vm_state=vm_states.ACTIVE,
+             task_state=None, power_state=power_state.SHUTDOWN)
+ 
++        @mock.patch.object(instance, 'refresh')
+         @mock.patch.object(self.compute, '_get_power_state',
+                            return_value=power_state.SHUTDOWN)
+         @mock.patch.object(self.compute, '_notify_about_instance_usage')
+         @mock.patch.object(self.compute, '_power_off_instance')
+         @mock.patch.object(instance, 'save')
+-        def do_test(save_mock, power_off_mock, notify_mock, get_state_mock):
++        def do_test(save_mock, power_off_mock, notify_mock, get_state_mock,
++                    refresh_mock):
+             # run the code
+             self.compute.stop_instance(self.context, instance, True)
+             # assert the calls
+             self.assertEqual(2, get_state_mock.call_count)
++            refresh_mock.assert_called_once_with()
+             notify_mock.assert_has_calls([
+                 mock.call(self.context, instance, 'power_off.start'),
+                 mock.call(self.context, instance, 'power_off.end')
+-- 
+2.20.1
+

@@ -1,0 +1,40 @@
+From f383c58d407e659e880dd32554a33abe7397424a Mon Sep 17 00:00:00 2001
+From: Bart Wensley <barton.wensley@windriver.com>
+Date: Wed, 20 Jul 2016 11:46:30 -0400
+Subject: [PATCH 1/1] Fix handling of KVM failure in mitaka
+
+The WRS changes to support KVM failure detection and recovery (commit
+2d6afc9174a) don't work in mitaka because upstream an additional
+check was added to handle_lifecycle_check to verify that event
+matches the current state of the instance (according to libvirt).
+When the hypervisor crashes, libvirt shows the guest in the shutdown
+state, but we map it to the crashed state so the VIM will restart the
+guest.
+
+The fix is to extend the state check in handle_lifecycle_event to
+handle this special case.
+---
+ nova/compute/manager.py | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 31b43a2521..b85979ecbd 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -1291,7 +1291,12 @@ class ComputeManager(manager.Manager):
+         # Note(lpetrut): The event may be delayed, thus not reflecting
+         # the current instance power state. In that case, ignore the event.
+         current_power_state = self._get_power_state(context, instance)
+-        if current_power_state == vm_power_state:
++        if (current_power_state == vm_power_state or
++                # WRS: We map hypervisor crashes to the CRASHED power state,
++                # but libvirt will put the guest in the SHUTDOWN state. See
++                # nova.virt.libvirt.host.Host._event_lifecycle_callback...
++                (vm_power_state == power_state.CRASHED and
++                 current_power_state == power_state.SHUTDOWN)):
+             LOG.debug('Synchronizing instance power state after lifecycle '
+                       'event "%(event)s"; current vm_state: %(vm_state)s, '
+                       'current task_state: %(task_state)s, current DB '
+-- 
+2.20.1
+
